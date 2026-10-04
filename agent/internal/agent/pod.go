@@ -129,19 +129,43 @@ func (a *Agent) SetupProcess(pod *Pod) error {
 	}
 	pod.DirPath = dir
 
-	cmd := exec.Command("cp", "Registry/main.sh", dir)
+	registryPath := fmt.Sprintf("%s/main", a.RegistryPath)
+	cmd := exec.Command("cp", registryPath, dir)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		log.Fatalf("cp falló: %v — %s", err, stderr.String())
+		log.Fatalf("cp failed : %v — %s", err, stderr.String())
 	}
 
-	cmd = exec.Command("cp", "Secrets/env.local", dir)
+	secretPath := fmt.Sprintf("%s/env.local", a.SecretManagerPath)
+	cmd = exec.Command("cp", secretPath, dir)
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		log.Fatalf("cp falló: %v — %s", err, stderr.String())
+		log.Fatalf("cp failed: %v — %s", err, stderr.String())
 	}
+
+	binaryPath := fmt.Sprintf("../%s/main", pod.ID)
+	cmd = exec.Command(binaryPath)
+
+	// Without this, the child's output is discarded (sent to /dev/null)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Opción B: no bloqueante
+	if err := cmd.Start(); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("PID:", cmd.Process.Pid)
+
+	time.Sleep(10 * time.Second)
+	cmd.Process.Signal(syscall.SIGTERM)
+	time.Sleep(10 * time.Second)
+	cmd.Process.Signal(syscall.SIGKILL)
+
+	// ... sigues haciendo cosas ...
+	cmd.Wait() // bloquea hasta que el hijo termina
+
 	return nil
 }
 
