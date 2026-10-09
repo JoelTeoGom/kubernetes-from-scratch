@@ -82,4 +82,6 @@ func main() {
 		fmt.Println(shutdownErr)
 	}
 
+	<-shutdownctx.Done()
+
 }

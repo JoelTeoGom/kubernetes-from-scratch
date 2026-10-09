@@ -3,12 +3,14 @@ package agent
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log"
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -37,6 +39,8 @@ type Pod struct {
 type Process struct {
 	PID     string
 	Process *os.Process
+	// Exited is closed once the process is gone, by the only goroutine that calls Wait
+	Exited chan struct{}
 }
 
 type Status string
@@ -158,13 +162,19 @@ func (a *Agent) SetupProcess(pod *Pod) error {
 	}
 	fmt.Println("PID:", cmd.Process.Pid)
 
-	time.Sleep(10 * time.Second)
-	cmd.Process.Signal(syscall.SIGTERM)
-	time.Sleep(10 * time.Second)
-	cmd.Process.Signal(syscall.SIGKILL)
+	exited := make(chan struct{})
+	pod.Process = Process{
+		PID:     strconv.Itoa(cmd.Process.Pid),
+		Process: cmd.Process,
+		Exited:  exited,
+	}
 
-	// ... sigues haciendo cosas ...
-	cmd.Wait() // bloquea hasta que el hijo termina
+	// Wait can only be called once per process, so this goroutine owns it (and reaps the zombie)
+	// while shutdown, remove and health checks just listen on Exited
+	go func() {
+		cmd.Wait()
+		close(exited)
+	}()
 
 	return nil
 }
@@ -323,24 +333,28 @@ func (a *Agent) ShutdownPod(ctx context.Context, pod *Pod) error {
 		return err
 	}
 
-	//10 sec grace time
+	//10 sec grace time, cut short if the node shutdown ctx runs out first
 	waitCtx, cancel := context.WithTimeout(ctx, PodGraceTime)
 	defer cancel()
-loop:
-	for {
-		select {
-		case <-waitCtx.Done():
-			err = a.ReleaseIP(pod.IP)
-			if err != nil {
-				fmt.Println(err)
-			}
-			err = pod.Process.Process.Signal(syscall.SIGKILL)
-			if err != nil {
-				fmt.Println(err)
-				return err
-			}
-			break loop
+
+	select {
+	case <-pod.Process.Exited:
+		// the pod handled SIGTERM and exited on its own
+	case <-waitCtx.Done():
+		// the pod may exit right between the timeout and the kill, that is not an error
+		err = pod.Process.Process.Signal(syscall.SIGKILL)
+		if err != nil && !errors.Is(err, os.ErrProcessDone) {
+			fmt.Println(err)
+			return err
 		}
+		// SIGKILL cannot be ignored, so this wait is short
+		<-pod.Process.Exited
+	}
+
+	// the process is confirmed dead here, whichever way it went
+	err = a.ReleaseIP(pod.IP)
+	if err != nil {
+		fmt.Println(err)
 	}
 	return nil
 }
