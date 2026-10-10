@@ -120,6 +120,13 @@ func (a *Agent) CreatePod(serviceName string) (pod *Pod, err error) {
 		return nil, err
 	}
 
+	//4. Writing pod.json so a restarted agent can adopt the pod
+	// The pod is already serving traffic, so a failure here is not worth tearing it down:
+	// it only means this pod will not be adopted after a restart
+	if stateErr := savePodState(pod); stateErr != nil {
+		fmt.Printf("pod %s will not survive an agent restart: %v\n", pod.ID, stateErr)
+	}
+
 	service.LocalPods = append(service.LocalPods, pod)
 
 	return pod, nil
@@ -195,19 +202,20 @@ func (a *Agent) SetupProcess(pod *Pod) error {
 func (s *Service) SetupPodIptables(pod *Pod) error {
 	newBackend := Backend{ID: pod.ID, IP: pod.IP, Port: s.PodPort}
 
-	//1. Creating Backends
-	clusterBackends := append(s.Backends(), newBackend)
-	localBackends := append(s.LocalBackends(), newBackend)
+	return s.writeChains(append(s.Backends(), newBackend), append(s.LocalBackends(), newBackend))
+}
 
-	//2. Making sure every backend has its endpoint chain (remote nodes included) before
-	// touching the service chains, so a failure here leaves the current rules untouched
+// writeChains makes sure every backend has its endpoint chain (remote nodes included) and
+// then rewrites both service chains. Endpoint chains go first, so a failure there leaves the
+// current service rules untouched
+func (s *Service) writeChains(clusterBackends, localBackends []Backend) error {
+	// localBackends is a subset of clusterBackends, so this covers every endpoint chain
 	for _, backend := range clusterBackends {
 		if err := ensureEndpointChain(backend); err != nil {
 			return err
 		}
 	}
 
-	//3. Rewriting both service chains, probabilities change with every backend added
 	if err := writeBalancingChain(s.ServiceChain(), clusterBackends); err != nil {
 		return err
 	}

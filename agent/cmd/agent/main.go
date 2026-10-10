@@ -49,6 +49,12 @@ func main() {
 		panic(err)
 	}
 
+	//Adopt pods left running by a previous agent before creating anything, so their IPs and
+	//IDs are taken and their services point to them again once they are created
+	if err := node.AdoptPods(); err != nil {
+		panic(err)
+	}
+
 	cp := apiclient.NewAPIClient(node, eventJobs)
 
 	//0. Register CP

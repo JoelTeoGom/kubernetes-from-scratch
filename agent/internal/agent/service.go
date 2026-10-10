@@ -105,12 +105,20 @@ func (n *Agent) CreateService(name, clusterIP, clusterPort, nodePort, podPort st
 
 	newService := NewService(name, clusterIP, clusterPort, nodePort, podPort)
 
+	// pods of this service that survived an agent restart go back in before the rules
+	// are written, so the service chains point to them from the start
+	for _, adoptedPod := range n.adopted[name] {
+		newService.takenIDs[adoptedPod.ID] = true
+		newService.LocalPods = append(newService.LocalPods, adoptedPod)
+	}
+
 	// registered only once the rules are in place, so a half set up service never
 	// ends up in the map for CreatePod to trip over
 	if err := newService.CreateServiceSetup(name, n.NodeIP); err != nil {
 		return nil, err
 	}
 	n.Services[name] = newService
+	delete(n.adopted, name)
 
 	return newService, nil
 }
@@ -145,12 +153,10 @@ func (s *Service) CreateServiceSetup(name, nodeIP string) error {
 		return err
 	}
 
-	//3. Rejecting traffic while service has no pods
-	// An empty backend list writes a single REJECT rule
-	if err := writeBalancingChain(s.ServiceChain(), nil); err != nil {
-		return err
-	}
-	return writeBalancingChain(s.ExternalChain(), nil)
+	//3. Pointing the service chains to the pods it already has
+	// After an agent restart these are the adopted pods, which keep serving traffic.
+	// With no pods yet, an empty backend list writes a single REJECT rule
+	return s.writeChains(s.Backends(), s.LocalBackends())
 }
 
 // GetNextPodID returns the lowest free pod ID for this service and marks it as taken

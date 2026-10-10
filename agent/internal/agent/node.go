@@ -24,6 +24,10 @@ type Agent struct {
 	//(valid pod IPs for /24: .2 - .254 -> 253 IPs; .0 network, .1 gateway, .255 broadcast are reserved)
 	allocated map[string]bool
 
+	//pods found alive by AdoptPods, keyed by service name, waiting for their service to be
+	//created again so they can be put back into its LocalPods
+	adopted map[string][]*Pod
+
 	RegistryPath      string // where pod binaries are taken from (<RegistryPath>/main)
 	SecretManagerPath string // where pod env files are taken from (<SecretManagerPath>/env.local)
 	PodsPath          string // one directory per pod (<PodsPath>/<podID>)
@@ -50,6 +54,7 @@ func NewAgent(nodeID, nodeIP, podCIDR, bridgeName, gatewayIP, controlPlaneURL st
 		ControlPlaneURL: controlPlaneURL,
 		Services:        make(map[string]*Service),
 		allocated:       map[string]bool{},
+		adopted:         map[string][]*Pod{},
 
 		RegistryPath:      filepath.Join(DataDir, "registry"),
 		SecretManagerPath: filepath.Join(DataDir, "secrets"),
