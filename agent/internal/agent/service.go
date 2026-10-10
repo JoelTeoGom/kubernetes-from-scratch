@@ -23,6 +23,7 @@ type Service struct {
 	//a released ID goes back to false so the index can be reused without shifting the others
 	takenIDs map[string]bool
 }
+
 // Backend is one destination of the service chain
 // ID is also the name of its KUBE-SEP endpoint chain, which DNATs to IP:Port
 // (pod IP + pod port for a local pod, node IP + node port for a remote node)
@@ -114,32 +115,42 @@ func (n *Agent) CreateService(name, clusterIP, clusterPort, nodePort, podPort st
 	return newService, nil
 }
 
-func (s *Service) CreateServiceSetup(name, nodeIP string) error {
-	//1. Creating service chain
+// ServiceChain is the chain ClusterIP traffic lands in (local pods + remote nodes)
+func (s *Service) ServiceChain() string {
+	return fmt.Sprintf("%s-%s", KubeServiceChainPrefix, s.Name)
+}
 
-	serviceName := fmt.Sprintf("%s-%s", KubeServiceChainPrefix, name)
-	if err := runIgnoreExists("iptables", "-t", "nat", "-N", serviceName); err != nil {
-		return err
+// ExternalChain is the chain NodePort traffic lands in (local pods only)
+func (s *Service) ExternalChain() string {
+	return fmt.Sprintf("%s-%s", KubeExternalChainPrefix, s.Name)
+}
+
+func (s *Service) CreateServiceSetup(name, nodeIP string) error {
+	//1. Creating service chains
+	for _, chain := range []string{s.ServiceChain(), s.ExternalChain()} {
+		if err := runIgnoreExists("iptables", "-t", "nat", "-N", chain); err != nil {
+			return err
+		}
 	}
 
-	//2. Jumping from KUBE-SERVICES to service chain (ClusterIP and NodePort)
+	//2. Jumping from KUBE-SERVICES to service chains
+	// ClusterIP may be served by any node, NodePort only by this node's pods
 	// /32 is what iptables assumes for a bare host address, spelled out so the rule
 	// reads the same here as it does in iptables -S
-	if err := run("iptables", "-t", "nat", "-A", "KUBE-SERVICES", "-d", s.ClusterIP+"/32", "-p", "tcp", "--dport", s.ClusterPort, "-j", serviceName); err != nil {
+	if err := run("iptables", "-t", "nat", "-A", "KUBE-SERVICES", "-d", s.ClusterIP+"/32", "-p", "tcp", "--dport", s.ClusterPort, "-j", s.ServiceChain()); err != nil {
 		return err
 	}
 
-	if err := run("iptables", "-t", "nat", "-A", "KUBE-SERVICES", "-d", nodeIP+"/32", "-p", "tcp", "--dport", s.NodePort, "-j", serviceName); err != nil {
+	if err := run("iptables", "-t", "nat", "-A", "KUBE-SERVICES", "-d", nodeIP+"/32", "-p", "tcp", "--dport", s.NodePort, "-j", s.ExternalChain()); err != nil {
 		return err
 	}
 
 	//3. Rejecting traffic while service has no pods
-	// icmp-port-unreachable so a client fails right away instead of waiting for a timeout
-	if err := run("iptables", "-t", "nat", "-A", serviceName, "-j", "REJECT", "--reject-with", "icmp-port-unreachable"); err != nil {
+	// An empty backend list writes a single REJECT rule
+	if err := writeBalancingChain(s.ServiceChain(), nil); err != nil {
 		return err
 	}
-
-	return nil
+	return writeBalancingChain(s.ExternalChain(), nil)
 }
 
 // GetNextPodID returns the lowest free pod ID for this service and marks it as taken
@@ -166,16 +177,18 @@ func (s *Service) ReleaseID(releasedID string) error {
 	return nil
 }
 
-// Backends returns local pods first and then remote nodes that also serve this service
-func (s *Service) Backends() []Backend {
+// LocalBackends returns only the pods running on this node
+func (s *Service) LocalBackends() []Backend {
 	var backends []Backend
 	for _, pod := range s.LocalPods {
 		backends = append(backends, Backend{ID: pod.ID, IP: pod.IP, Port: s.PodPort})
 	}
-	for _, externalBackend := range s.RemoteBackends {
-		backends = append(backends, externalBackend)
-	}
 	return backends
+}
+
+// Backends returns local pods first and then remote nodes that also serve this service
+func (s *Service) Backends() []Backend {
+	return append(s.LocalBackends(), s.RemoteBackends...)
 }
 
 func (a *Agent) ShutdownPods(ctx context.Context, s *Service) error {

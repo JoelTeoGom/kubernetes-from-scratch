@@ -17,9 +17,11 @@ import (
 )
 
 const (
-	// KUBE-SVC-<service> holds the load balancing rules, KUBE-SEP-<service>-<n> is one
-	// endpoint chain per pod, so iptables -S tells them apart at a glance
+	// KUBE-SVC-<service> balances ClusterIP traffic over local pods and remote nodes,
+	// KUBE-EXT-<service> balances NodePort traffic over local pods only, and
+	// KUBE-SEP-<service>-<n> is one endpoint chain per backend, so iptables -S tells them apart at a glance
 	KubeServiceChainPrefix  = "KUBE-SVC"
+	KubeExternalChainPrefix = "KUBE-EXT"
 	KubeEndpointChainPrefix = "KUBE-SEP"
 	PodGraceTime            = 10 * time.Second
 )
@@ -97,8 +99,6 @@ func (a *Agent) CreatePod(serviceName string) (pod *Pod, err error) {
 		}
 	}()
 
-	kubeService := fmt.Sprintf("%s-%s", KubeServiceChainPrefix, serviceName)
-
 	pod = NewPod(podID, serviceName, podIP)
 
 	//KUBELET FUNCTIONS
@@ -114,7 +114,7 @@ func (a *Agent) CreatePod(serviceName string) (pod *Pod, err error) {
 
 	//KUBE-PROXY FUNCTIONS
 	//3.setting up ip table rules for the pod
-	if err = service.SetupPodIptables(kubeService, pod); err != nil {
+	if err = service.SetupPodIptables(pod); err != nil {
 		return nil, err
 	}
 
@@ -181,36 +181,52 @@ func (a *Agent) SetupProcess(pod *Pod) error {
 	return nil
 }
 
-// SetupPodIptables creates the new pod endpoint chain and rewrites the service chain with a jump to every backend
-// Probabilities are 1/n, 1/(n-1), ..., and the last rule has no probability so it takes whatever is left
-func (s *Service) SetupPodIptables(kubeService string, pod *Pod) error {
+// SetupPodIptables creates the new pod endpoint chain and rewrites both service chains with it
+//   - KUBE-SVC (ClusterIP): local pods + remote nodes, this is where a call can leave the node
+//   - KUBE-EXT (NodePort): local pods only. Whoever reaches NodeIP:NodePort already picked this
+//     node, so sending it on to another node would only bounce the packet between nodes
+func (s *Service) SetupPodIptables(pod *Pod) error {
+	newBackend := Backend{ID: pod.ID, IP: pod.IP, Port: s.PodPort}
 
 	//1. Creating Backends
-	backends := s.Backends()
-	backends = append(backends, Backend{ID: pod.ID, IP: pod.IP, Port: s.PodPort})
-	backendCount := len(backends)
+	clusterBackends := append(s.Backends(), newBackend)
+	localBackends := append(s.LocalBackends(), newBackend)
 
 	//2. Making sure every backend has its endpoint chain (remote nodes included) before
-	// touching the service chain, so a failure here leaves the current rules untouched
-	for _, backend := range backends {
+	// touching the service chains, so a failure here leaves the current rules untouched
+	for _, backend := range clusterBackends {
 		if err := ensureEndpointChain(backend); err != nil {
 			return err
 		}
 	}
 
-	//3. Flushing service chain, it is rewritten entirely because probabilities change
-	if err := run("iptables", "-t", "nat", "-F", kubeService); err != nil {
+	//3. Rewriting both service chains, probabilities change with every backend added
+	if err := writeBalancingChain(s.ServiceChain(), clusterBackends); err != nil {
+		return err
+	}
+	return writeBalancingChain(s.ExternalChain(), localBackends)
+}
+
+// writeBalancingChain flushes the chain and spreads tcp traffic evenly over the backends
+// Probabilities are 1/n, 1/(n-1), ..., and the last rule has no probability so it takes whatever is left
+// With no backends it rejects, so a client fails right away instead of waiting for a timeout
+func writeBalancingChain(chain string, backends []Backend) error {
+	if err := run("iptables", "-t", "nat", "-F", chain); err != nil {
 		return err
 	}
 
-	//4. Jumping from service chain to every backend
+	backendCount := len(backends)
+	if backendCount == 0 {
+		return run("iptables", "-t", "nat", "-A", chain, "-j", "REJECT", "--reject-with", "icmp-port-unreachable")
+	}
+
 	for backendIndex, backend := range backends {
 		var err error
 		if backendIndex == backendCount-1 {
-			err = run("iptables", "-t", "nat", "-A", kubeService, "-p", "tcp", "-j", backend.ID)
+			err = run("iptables", "-t", "nat", "-A", chain, "-p", "tcp", "-j", backend.ID)
 		} else {
 			probability := 1.0 / float64(backendCount-backendIndex)
-			err = run("iptables", "-t", "nat", "-A", kubeService, "-p", "tcp",
+			err = run("iptables", "-t", "nat", "-A", chain, "-p", "tcp",
 				"-m", "statistic", "--mode", "random",
 				"--probability", fmt.Sprintf("%.5f", probability), "-j", backend.ID)
 		}
@@ -218,7 +234,6 @@ func (s *Service) SetupPodIptables(kubeService string, pod *Pod) error {
 			return err
 		}
 	}
-
 	return nil
 }
 
