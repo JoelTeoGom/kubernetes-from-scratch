@@ -25,7 +25,7 @@ type Service struct {
 }
 
 // Backend is one destination of the service chain
-// ID is also the name of its KUBE-SEP endpoint chain, which DNATs to IP:Port
+// Its KUBE-SEP endpoint chain (endpointChain(ID)) DNATs to IP:Port
 // (pod IP + pod port for a local pod, node IP + node port for a remote node)
 type Backend struct {
 	ID   string
@@ -34,10 +34,10 @@ type Backend struct {
 }
 
 // NewRemoteBackend builds the backend for another node serving this service
-// The node ID goes in the chain name so it never collides with a local pod index
+// "@" never shows up in a local pod ID (<service>-<n>), so the two can never collide
 func NewRemoteBackend(serviceName, nodeID, nodeIP, nodePort string) Backend {
 	return Backend{
-		ID:   fmt.Sprintf("%s-%s-%s", KubeEndpointChainPrefix, serviceName, nodeID),
+		ID:   fmt.Sprintf("%s@%s", serviceName, nodeID),
 		IP:   nodeIP,
 		Port: nodePort,
 	}
@@ -125,12 +125,12 @@ func (n *Agent) CreateService(name, clusterIP, clusterPort, nodePort, podPort st
 
 // ServiceChain is the chain ClusterIP traffic lands in (local pods + remote nodes)
 func (s *Service) ServiceChain() string {
-	return fmt.Sprintf("%s-%s", KubeServiceChainPrefix, s.Name)
+	return chainName(KubeServiceChainPrefix, s.Name)
 }
 
 // ExternalChain is the chain NodePort traffic lands in (local pods only)
 func (s *Service) ExternalChain() string {
-	return fmt.Sprintf("%s-%s", KubeExternalChainPrefix, s.Name)
+	return chainName(KubeExternalChainPrefix, s.Name)
 }
 
 func (s *Service) CreateServiceSetup(name, nodeIP string) error {
@@ -145,11 +145,13 @@ func (s *Service) CreateServiceSetup(name, nodeIP string) error {
 	// ClusterIP may be served by any node, NodePort only by this node's pods
 	// /32 is what iptables assumes for a bare host address, spelled out so the rule
 	// reads the same here as it does in iptables -S
-	if err := ensureRule("nat", "KUBE-SERVICES", "-d", s.ClusterIP+"/32", "-p", "tcp", "--dport", s.ClusterPort, "-j", s.ServiceChain()); err != nil {
+	if err := ensureRule("nat", "KUBE-SERVICES", "-d", s.ClusterIP+"/32", "-p", "tcp", "--dport", s.ClusterPort,
+		"-m", "comment", "--comment", s.Name+" cluster IP", "-j", s.ServiceChain()); err != nil {
 		return err
 	}
 
-	if err := ensureRule("nat", "KUBE-SERVICES", "-d", nodeIP+"/32", "-p", "tcp", "--dport", s.NodePort, "-j", s.ExternalChain()); err != nil {
+	if err := ensureRule("nat", "KUBE-SERVICES", "-d", nodeIP+"/32", "-p", "tcp", "--dport", s.NodePort,
+		"-m", "comment", "--comment", s.Name+" node port", "-j", s.ExternalChain()); err != nil {
 		return err
 	}
 
@@ -165,7 +167,7 @@ func (s *Service) CreateServiceSetup(name, nodeIP string) error {
 func (s *Service) GetNextPodID() (string, error) {
 	// with n IDs known, index n is free at worst, so the scan always terminates
 	for index := 0; index <= len(s.takenIDs); index++ {
-		podID := fmt.Sprintf("%s-%s-%d", KubeEndpointChainPrefix, s.Name, index)
+		podID := fmt.Sprintf("%s-%d", s.Name, index)
 		if !s.takenIDs[podID] {
 			s.takenIDs[podID] = true
 			return podID, nil

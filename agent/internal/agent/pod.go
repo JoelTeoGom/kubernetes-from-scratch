@@ -16,9 +16,9 @@ import (
 )
 
 const (
-	// KUBE-SVC-<service> balances ClusterIP traffic over local pods and remote nodes,
-	// KUBE-EXT-<service> balances NodePort traffic over local pods only, and
-	// KUBE-SEP-<service>-<n> is one endpoint chain per backend, so iptables -S tells them apart at a glance
+	// KUBE-SVC-<hash> balances ClusterIP traffic over local pods and remote nodes,
+	// KUBE-EXT-<hash> balances NodePort traffic over local pods only, and
+	// KUBE-SEP-<hash> is one endpoint chain per backend (see chainName for the hash)
 	KubeServiceChainPrefix  = "KUBE-SVC"
 	KubeExternalChainPrefix = "KUBE-EXT"
 	KubeEndpointChainPrefix = "KUBE-SEP"
@@ -238,12 +238,14 @@ func writeBalancingChain(chain string, backends []Backend) error {
 	for backendIndex, backend := range backends {
 		var err error
 		if backendIndex == backendCount-1 {
-			err = run("iptables", "-t", "nat", "-A", chain, "-p", "tcp", "-j", backend.ID)
+			err = run("iptables", "-t", "nat", "-A", chain, "-p", "tcp",
+				"-m", "comment", "--comment", backend.ID, "-j", endpointChain(backend.ID))
 		} else {
 			probability := 1.0 / float64(backendCount-backendIndex)
 			err = run("iptables", "-t", "nat", "-A", chain, "-p", "tcp",
 				"-m", "statistic", "--mode", "random",
-				"--probability", fmt.Sprintf("%.5f", probability), "-j", backend.ID)
+				"--probability", fmt.Sprintf("%.5f", probability),
+				"-m", "comment", "--comment", backend.ID, "-j", endpointChain(backend.ID))
 		}
 		if err != nil {
 			return err
@@ -256,13 +258,15 @@ func writeBalancingChain(chain string, backends []Backend) error {
 // It is created if missing and flushed otherwise, so it also fixes a chain left behind
 // by a crash or pointing to an old address
 func ensureEndpointChain(backend Backend) error {
-	if err := runIgnoreExists("iptables", "-t", "nat", "-N", backend.ID); err != nil {
+	chain := endpointChain(backend.ID)
+	if err := runIgnoreExists("iptables", "-t", "nat", "-N", chain); err != nil {
 		return err
 	}
-	if err := run("iptables", "-t", "nat", "-F", backend.ID); err != nil {
+	if err := run("iptables", "-t", "nat", "-F", chain); err != nil {
 		return err
 	}
-	return run("iptables", "-t", "nat", "-A", backend.ID, "-p", "tcp", "-j", "DNAT",
+	return run("iptables", "-t", "nat", "-A", chain, "-p", "tcp",
+		"-m", "comment", "--comment", backend.ID, "-j", "DNAT",
 		"--to-destination", fmt.Sprintf("%s:%s", backend.IP, backend.Port))
 }
 
@@ -381,8 +385,8 @@ func removePodResources(podID, netns, vethHost, podDir string) {
 	run("ip", "netns", "del", netns)
 	run("ip", "link", "del", vethHost)
 	// -X only works once no service chain jumps to it anymore
-	run("iptables", "-t", "nat", "-F", podID)
-	run("iptables", "-t", "nat", "-X", podID)
+	run("iptables", "-t", "nat", "-F", endpointChain(podID))
+	run("iptables", "-t", "nat", "-X", endpointChain(podID))
 	if podDir != "" {
 		os.RemoveAll(podDir)
 	}
