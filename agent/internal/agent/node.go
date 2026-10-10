@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -23,9 +24,14 @@ type Agent struct {
 	//(valid pod IPs for /24: .2 - .254 -> 253 IPs; .0 network, .1 gateway, .255 broadcast are reserved)
 	allocated map[string]bool
 
-	RegistryPath      string
-	SecretManagerPath string
+	RegistryPath      string // where pod binaries are taken from (<RegistryPath>/main)
+	SecretManagerPath string // where pod env files are taken from (<SecretManagerPath>/env.local)
+	PodsPath          string // one directory per pod (<PodsPath>/<podID>)
 }
+
+// DataDir holds everything the agent keeps on disk, absolute so it does not depend on
+// the directory the agent was started from
+const DataDir = "/var/lib/orchard"
 
 type Bridge struct {
 	Name      string // br0
@@ -44,19 +50,23 @@ func NewAgent(nodeID, nodeIP, podCIDR, bridgeName, gatewayIP, controlPlaneURL st
 		ControlPlaneURL: controlPlaneURL,
 		Services:        make(map[string]*Service),
 		allocated:       map[string]bool{},
+
+		RegistryPath:      filepath.Join(DataDir, "registry"),
+		SecretManagerPath: filepath.Join(DataDir, "secrets"),
+		PodsPath:          filepath.Join(DataDir, "pods"),
 	}, nil
 }
 
 func (a *Agent) InitNodeSetup() error {
-	//0. Create Container registry + secret
-	err := os.MkdirAll("Registry", 0777)
-	if err != nil {
-		fmt.Printf("Error")
+	//0. Creating registry, secrets and pods directories
+	// secrets is only readable by root, the agent runs as root anyway
+	if err := os.MkdirAll(a.RegistryPath, 0755); err != nil {
 		return err
 	}
-	err = os.MkdirAll("Secrets", 0777)
-	if err != nil {
-		fmt.Printf("Error")
+	if err := os.MkdirAll(a.SecretManagerPath, 0700); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(a.PodsPath, 0755); err != nil {
 		return err
 	}
 

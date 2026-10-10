@@ -1,15 +1,14 @@
 package agent
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"log"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -123,46 +122,41 @@ func (a *Agent) CreatePod(serviceName string) (pod *Pod, err error) {
 	return pod, nil
 }
 
+// SetupProcess prepares the pod directory and starts the pod binary inside the pod netns
+//  1. <PodsPath>/<podID> is created
+//  2. the binary and the env file are copied from the registry and the secrets directory
+//  3. the binary is started with ip netns exec, from the pod directory so it finds env.local
 func (a *Agent) SetupProcess(pod *Pod) error {
 	//1. Check or create Pod directory
-	//2. Move binary + env file to directory
-	//3. Execute binary +
-
-	dir := fmt.Sprintf("/Pods/%s", pod.ID)
-	err := os.MkdirAll(dir, 0777)
-	if err != nil {
-		panic(err)
+	dir := filepath.Join(a.PodsPath, pod.ID)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("pod %s directory: %w", pod.ID, err)
 	}
 	pod.DirPath = dir
 
-	registryPath := fmt.Sprintf("%s/main", a.RegistryPath)
-	cmd := exec.Command("cp", registryPath, dir)
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		log.Fatalf("cp failed : %v — %s", err, stderr.String())
+	//2. Copying binary + env file to the pod directory
+	// cp keeps the exec bit of the binary
+	if err := run("cp", filepath.Join(a.RegistryPath, "main"), dir); err != nil {
+		return err
+	}
+	if err := run("cp", filepath.Join(a.SecretManagerPath, "env.local"), dir); err != nil {
+		return err
 	}
 
-	secretPath := fmt.Sprintf("%s/env.local", a.SecretManagerPath)
-	cmd = exec.Command("cp", secretPath, dir)
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		log.Fatalf("cp failed: %v — %s", err, stderr.String())
-	}
-
-	binaryPath := fmt.Sprintf("../%s/main", pod.ID)
-	cmd = exec.Command(binaryPath)
+	//3. Executing the binary inside the pod netns
+	// ip netns exec joins the netns and then execs the binary, so the PID we get is the binary's
+	cmd := exec.Command("ip", "netns", "exec", pod.NetNS, filepath.Join(dir, "main"))
+	cmd.Dir = dir
 
 	// Without this, the child's output is discarded (sent to /dev/null)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	// Opción B: no bloqueante
+	// Start does not block, the process keeps running after SetupProcess returns
 	if err := cmd.Start(); err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("pod %s start: %w", pod.ID, err)
 	}
-	fmt.Println("PID:", cmd.Process.Pid)
+	pod.Status = StatusRunning
 
 	exited := make(chan struct{})
 	pod.Process = Process{
@@ -389,4 +383,3 @@ func (a *Agent) ShutdownPod(ctx context.Context, pod *Pod) error {
 	}
 	return nil
 }
-func (p *Pod) CreatePodContainer()
