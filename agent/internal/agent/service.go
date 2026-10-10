@@ -137,11 +137,11 @@ func (s *Service) CreateServiceSetup(name, nodeIP string) error {
 	// ClusterIP may be served by any node, NodePort only by this node's pods
 	// /32 is what iptables assumes for a bare host address, spelled out so the rule
 	// reads the same here as it does in iptables -S
-	if err := run("iptables", "-t", "nat", "-A", "KUBE-SERVICES", "-d", s.ClusterIP+"/32", "-p", "tcp", "--dport", s.ClusterPort, "-j", s.ServiceChain()); err != nil {
+	if err := ensureRule("nat", "KUBE-SERVICES", "-d", s.ClusterIP+"/32", "-p", "tcp", "--dport", s.ClusterPort, "-j", s.ServiceChain()); err != nil {
 		return err
 	}
 
-	if err := run("iptables", "-t", "nat", "-A", "KUBE-SERVICES", "-d", nodeIP+"/32", "-p", "tcp", "--dport", s.NodePort, "-j", s.ExternalChain()); err != nil {
+	if err := ensureRule("nat", "KUBE-SERVICES", "-d", nodeIP+"/32", "-p", "tcp", "--dport", s.NodePort, "-j", s.ExternalChain()); err != nil {
 		return err
 	}
 

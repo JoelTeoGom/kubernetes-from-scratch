@@ -140,6 +140,18 @@ func ensureJump(table, builtinChain, kubeChain string) error {
 	return run("iptables", "-t", table, "-I", builtinChain, "1", "-j", kubeChain)
 }
 
+// ensureRule appends a rule to a chain only when it is not there yet,
+// because -A always appends and would stack one more copy on every restart
+func ensureRule(table, chain string, rule ...string) error {
+	// iptables -C exits 0 when the rule already exists
+	checkArgs := append([]string{"-t", table, "-C", chain}, rule...)
+	if err := run("iptables", checkArgs...); err == nil {
+		return nil
+	}
+	appendArgs := append([]string{"-t", table, "-A", chain}, rule...)
+	return run("iptables", appendArgs...)
+}
+
 // runIgnoreExists runs a create command and swallows only the "already there" error,
 // so restarting the agent on an already initialised node is not treated as a failure
 func runIgnoreExists(name string, args ...string) error {
