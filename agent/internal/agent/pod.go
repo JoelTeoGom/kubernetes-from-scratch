@@ -23,6 +23,9 @@ const (
 	KubeExternalChainPrefix = "KUBE-EXT"
 	KubeEndpointChainPrefix = "KUBE-SEP"
 	PodGraceTime            = 10 * time.Second
+
+	// podLogFile collects the pod stdout and stderr inside its directory
+	podLogFile = "out.log"
 )
 
 type Pod struct {
@@ -148,9 +151,19 @@ func (a *Agent) SetupProcess(pod *Pod) error {
 	cmd := exec.Command("ip", "netns", "exec", pod.NetNS, filepath.Join(dir, "main"))
 	cmd.Dir = dir
 
-	// Without this, the child's output is discarded (sent to /dev/null)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// The pod must outlive the agent:
+	//   - its own session, so a Ctrl-C or a signal sent to the agent process group never reaches it
+	//   - its output goes to a file it owns, not to the agent stdout, which would vanish (or SIGPIPE
+	//     the pod) once the agent is gone
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	logFile, err := os.OpenFile(filepath.Join(dir, podLogFile), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("pod %s log file: %w", pod.ID, err)
+	}
+	// the child gets its own copy of the descriptor on Start, the agent does not need it afterwards
+	defer logFile.Close()
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
 
 	// Start does not block, the process keeps running after SetupProcess returns
 	if err := cmd.Start(); err != nil {
