@@ -44,11 +44,11 @@ client ──▶ lb data plane ──▶ nodeIP:NodePort
                             KUBE-SERVICES          -d clusterIP --dport → KUBE-SVC (local + remote)
                                    │               -d nodeIP   --dport → KUBE-EXT (local only)
                                    ▼
-                            KUBE-SVC-<service>     -m statistic --probability 1/n
+                            KUBE-SVC-<hash>        -m statistic --probability 1/n
                                    │
                     ┌──────────────┼──────────────┐
                     ▼              ▼              ▼
-            KUBE-SEP-<svc>-0   ...-1      (remote node backend)
+            KUBE-SEP-<hash>  KUBE-SEP-<hash>  (remote node backend)
                     │
               DNAT podIP:podPort
                     │
@@ -65,6 +65,29 @@ probability `1/n`, `1/(n-1)`, …, and the last one unconditional.
 Which means the actual packet-by-packet balancing inside a node is done by **the kernel**.
 The agent's job is to compute the probabilities and keep the rules correct as pods come and
 go. That is a control plane, not a data plane — the same split as the real thing.
+
+### Chain names are hashed
+
+iptables allows at most 28 characters per chain name, and a readable name like
+`KUBE-SEP-payments-gateway-node-12` does not fit. So, like kube-proxy, every chain is a fixed
+prefix plus the first 16 characters of the base32 SHA-256 of what it stands for, always 25
+characters long. The readable part goes into a `-m comment` on each rule:
+
+```
+-A KUBE-SERVICES -d 10.96.0.10/32 -p tcp --dport 80 -m comment --comment "payments cluster IP" -j KUBE-SVC-344EV2L4O6WTAALC
+-A KUBE-SVC-344EV2L4O6WTAALC -p tcp -m statistic --mode random --probability 0.50000 -m comment --comment payments-0 -j KUBE-SEP-26QISHB54PXAUUTJ
+-A KUBE-SVC-344EV2L4O6WTAALC -p tcp -m comment --comment payments@node-2 -j KUBE-SEP-UWGBZ3MP4ZQEVOXT
+```
+
+| Chain | Hash of | Example |
+|---|---|---|
+| `KUBE-SVC-*` | service name | `payments` |
+| `KUBE-EXT-*` | service name | `payments` |
+| `KUBE-SEP-*`, local pod | pod ID, `<service>-<n>` | `payments-0` |
+| `KUBE-SEP-*`, remote node | `<service>@<node>` | `payments@node-2` |
+
+The rest of this README writes chains with readable names (`KUBE-SVC-payments`) to keep the
+examples easy to follow.
 
 ### Balancing happens twice
 
@@ -124,12 +147,12 @@ KUBE-SERVICES
 3. `KUBE-SVC-payments` has one rule per backend, local pods first and remote nodes after:
    ```
    -m statistic --probability 0.33333 -j KUBE-SEP-payments-0        (local pod)
-   -m statistic --probability 0.50000 -j KUBE-SEP-payments-node-2   (node 2)
-                                      -j KUBE-SEP-payments-node-3   (node 3)
+   -m statistic --probability 0.50000 -j KUBE-SEP-payments@node-2   (node 2)
+                                      -j KUBE-SEP-payments@node-3   (node 3)
    ```
    Each backend ends up with 1/3: the first one takes 1/3, the second one 2/3 × 1/2 = 1/3,
    and the last one takes whatever is left.
-4. Say node 3 wins. `KUBE-SEP-payments-node-3` does `DNAT → NodeIP3:NodePort`.
+4. Say node 3 wins. `KUBE-SEP-payments@node-3` does `DNAT → NodeIP3:NodePort`.
 5. On the way out, `KUBE-POSTROUTING` sees a source inside the pod CIDR and a destination
    outside it, and applies `MASQUERADE`. The packet leaves with node 1's IP as its source.
 
@@ -185,7 +208,7 @@ Everything lives under `/var/lib/orchard` on each node:
 ├── registry/main          — the binary every pod runs (our "image registry")
 ├── secrets/env.local      — the env file every pod gets (our "secret manager")
 └── pods/
-    └── KUBE-SEP-payments-0/
+    └── payments-0/
         ├── main           — copy of the binary
         ├── env.local      — copy of the env file
         ├── out.log        — the pod's stdout and stderr
