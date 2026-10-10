@@ -181,15 +181,10 @@ func watchAdoptedProcess(pid int, startTime uint64, exited chan struct{}) {
 	}
 }
 
-// cleanupDeadPod removes what a dead pod left behind. Every step is best effort:
-// whatever is already gone is fine, and nothing here should stop the agent from starting
+// cleanupDeadPod removes what a dead pod left behind
+// Nothing here should stop the agent from starting, so every step is best effort.
+// The endpoint chain cannot be deleted while the service chain from the previous run still
+// jumps to it, but flushing it makes that jump fall through instead of reaching a dead pod
 func cleanupDeadPod(state podState, podDir string) {
-	// deleting the netns removes eth0 inside it, and with it the host end of the veth pair
-	run("ip", "netns", "del", state.NetNS)
-	run("ip", "link", "del", state.VethHost)
-	// -X fails while the service chain from the previous run still jumps to it; flushing it
-	// at least makes that jump fall through instead of sending traffic to a dead pod
-	run("iptables", "-t", "nat", "-F", state.ID)
-	run("iptables", "-t", "nat", "-X", state.ID)
-	os.RemoveAll(podDir)
+	removePodResources(state.ID, state.NetNS, state.VethHost, podDir)
 }

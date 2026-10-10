@@ -331,39 +331,61 @@ func vethNames(podID string) (string, string) {
 	return "veth" + podHash, "eth0" + podHash
 }
 
-// TODO(removepod): tearing a pod down must give its resources back, otherwise they
-// leak exactly like a failed create would: ReleaseIP for the pod IP, ReleaseID on the
-// service for the pod ID, delete the netns and the veth, drop its KUBE-SEP chain and
-// rewrite the service chain so the probabilities match the remaining backends
-func (a *Agent) RemovePod(pod *Pod) (*Pod, error) {
-	err := pod.Process.Process.Signal(syscall.SIGTERM)
-	if err != nil {
-		fmt.Println(err)
-		return pod, err
-	}
-	//10 sec grace time
-	waitCtx, cancel := context.WithTimeout(context.Background(), PodGraceTime)
-	defer cancel()
-loop:
-	for {
-		select {
-		case <-waitCtx.Done():
-			err = a.ReleaseIP(pod.IP)
-			if err != nil {
-				fmt.Println(err)
-			}
-			err = pod.Process.Process.Signal(syscall.SIGKILL)
-			if err != nil {
-				fmt.Println(err)
-				return pod, err
-			}
-			break loop
+// RemovePod tears a pod down and gives back everything CreatePod took, in this order:
+//  1. out of the service: dropped from LocalPods and both service chains rewritten, so no new
+//     connection reaches a pod that is shutting down (with no pods left the chains REJECT)
+//  2. process stopped: SIGTERM, grace time, SIGKILL
+//  3. netns, veth, endpoint chain and pod directory removed, pod.json included, so the next
+//     agent start does not find it
+//  4. pod IP and pod ID released for the next pod
+func (a *Agent) RemovePod(ctx context.Context, pod *Pod) error {
+	service, ok := a.Services[pod.ServiceName]
+	if ok {
+		service.removeLocalPod(pod.ID)
+		if err := service.writeChains(service.Backends(), service.LocalBackends()); err != nil {
+			return err
 		}
 	}
 
-	//TODO REMOVE FROM SERVICE LOCAL POD LIST
+	if err := stopProcess(ctx, pod); err != nil {
+		return err
+	}
 
-	return pod, nil
+	removePodResources(pod.ID, pod.NetNS, pod.VethHost, pod.DirPath)
+
+	if err := a.ReleaseIP(pod.IP); err != nil {
+		fmt.Println(err)
+	}
+	if ok {
+		if err := service.ReleaseID(pod.ID); err != nil {
+			fmt.Println(err)
+		}
+	}
+	return nil
+}
+
+// removeLocalPod drops a pod from LocalPods, keeping the order of the others
+func (s *Service) removeLocalPod(podID string) {
+	for index, localPod := range s.LocalPods {
+		if localPod.ID == podID {
+			s.LocalPods = append(s.LocalPods[:index], s.LocalPods[index+1:]...)
+			return
+		}
+	}
+}
+
+// removePodResources deletes what a pod leaves in the kernel and on disk. Every step is
+// best effort: whatever is already gone is fine
+func removePodResources(podID, netns, vethHost, podDir string) {
+	// deleting the netns removes eth0 inside it, and with it the host end of the veth pair
+	run("ip", "netns", "del", netns)
+	run("ip", "link", "del", vethHost)
+	// -X only works once no service chain jumps to it anymore
+	run("iptables", "-t", "nat", "-F", podID)
+	run("iptables", "-t", "nat", "-X", podID)
+	if podDir != "" {
+		os.RemoveAll(podDir)
+	}
 }
 
 func (n *Agent) CheckPodHealth(pod *Pod) (Status, error) {
@@ -372,14 +394,29 @@ func (n *Agent) CheckPodHealth(pod *Pod) (Status, error) {
 }
 
 func (a *Agent) ShutdownPod(ctx context.Context, pod *Pod) error {
-	//Signal sigterm
-	err := pod.Process.Process.Signal(syscall.SIGTERM)
+	if err := stopProcess(ctx, pod); err != nil {
+		return err
+	}
+
+	// the process is confirmed dead here, whichever way it went
+	err := a.ReleaseIP(pod.IP)
 	if err != nil {
+		fmt.Println(err)
+	}
+	return nil
+}
+
+// stopProcess sends SIGTERM and waits for the pod to exit, with SIGKILL after the grace time
+// It returns once the process is confirmed dead
+func stopProcess(ctx context.Context, pod *Pod) error {
+	// a pod that already died is not an error, Exited is (or is about to be) closed
+	err := pod.Process.Process.Signal(syscall.SIGTERM)
+	if err != nil && !errors.Is(err, os.ErrProcessDone) {
 		fmt.Println(err)
 		return err
 	}
 
-	//10 sec grace time, cut short if the node shutdown ctx runs out first
+	//10 sec grace time, cut short if ctx runs out first
 	waitCtx, cancel := context.WithTimeout(ctx, PodGraceTime)
 	defer cancel()
 
@@ -395,12 +432,6 @@ func (a *Agent) ShutdownPod(ctx context.Context, pod *Pod) error {
 		}
 		// SIGKILL cannot be ignored, so this wait is short
 		<-pod.Process.Exited
-	}
-
-	// the process is confirmed dead here, whichever way it went
-	err = a.ReleaseIP(pod.IP)
-	if err != nil {
-		fmt.Println(err)
 	}
 	return nil
 }
