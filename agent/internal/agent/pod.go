@@ -101,19 +101,21 @@ func (a *Agent) CreatePod(serviceName string) (pod *Pod, err error) {
 
 	pod = NewPod(podID, serviceName, podIP)
 
+	//KUBELET FUNCTIONS
 	//1.setting up netns
 	if err = a.SetupPodNetwork(pod); err != nil {
 		return nil, err
 	}
 
-	//2.setting up ip table
-	if err = service.SetupPodIptables(kubeService, pod); err != nil {
+	//2.Starting the process
+	if err = a.SetupProcess(pod); err != nil {
 		return nil, err
 	}
 
-	//3.Starting the process
-	if err = a.SetupProcess(pod); err != nil {
-
+	//KUBE-PROXY FUNCTIONS
+	//3.setting up ip table rules for the pod
+	if err = service.SetupPodIptables(kubeService, pod); err != nil {
+		return nil, err
 	}
 
 	service.LocalPods = append(service.LocalPods, pod)
@@ -183,21 +185,21 @@ func (a *Agent) SetupProcess(pod *Pod) error {
 // Probabilities are 1/n, 1/(n-1), ..., and the last rule has no probability so it takes whatever is left
 func (s *Service) SetupPodIptables(kubeService string, pod *Pod) error {
 
-	//1. Flushing service chain, it is rewritten entirely because probabilities change
-	if err := run("iptables", "-t", "nat", "-F", kubeService); err != nil {
-		return err
-	}
-
-	//2. Creating Backends
+	//1. Creating Backends
 	backends := s.Backends()
 	backends = append(backends, Backend{ID: pod.ID, IP: pod.IP, Port: s.PodPort})
 	backendCount := len(backends)
-	//3. Creating new pod endpoint chain with its DNAT to the pod
-	if err := run("iptables", "-t", "nat", "-N", pod.ID); err != nil {
-		return err
+
+	//2. Making sure every backend has its endpoint chain (remote nodes included) before
+	// touching the service chain, so a failure here leaves the current rules untouched
+	for _, backend := range backends {
+		if err := ensureEndpointChain(backend); err != nil {
+			return err
+		}
 	}
-	if err := run("iptables", "-t", "nat", "-A", pod.ID, "-p", "tcp", "-j", "DNAT",
-		"--to-destination", fmt.Sprintf("%s:%s", pod.IP, s.PodPort)); err != nil {
+
+	//3. Flushing service chain, it is rewritten entirely because probabilities change
+	if err := run("iptables", "-t", "nat", "-F", kubeService); err != nil {
 		return err
 	}
 
@@ -218,6 +220,20 @@ func (s *Service) SetupPodIptables(kubeService string, pod *Pod) error {
 	}
 
 	return nil
+}
+
+// ensureEndpointChain leaves the backend KUBE-SEP chain with exactly one DNAT to IP:Port
+// It is created if missing and flushed otherwise, so it also fixes a chain left behind
+// by a crash or pointing to an old address
+func ensureEndpointChain(backend Backend) error {
+	if err := runIgnoreExists("iptables", "-t", "nat", "-N", backend.ID); err != nil {
+		return err
+	}
+	if err := run("iptables", "-t", "nat", "-F", backend.ID); err != nil {
+		return err
+	}
+	return run("iptables", "-t", "nat", "-A", backend.ID, "-p", "tcp", "-j", "DNAT",
+		"--to-destination", fmt.Sprintf("%s:%s", backend.IP, backend.Port))
 }
 
 // SetupPodNetwork creates the pod netns, wires it to the node bridge with a veth pair and configures IP + default route

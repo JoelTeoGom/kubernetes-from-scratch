@@ -23,10 +23,23 @@ type Service struct {
 	//a released ID goes back to false so the index can be reused without shifting the others
 	takenIDs map[string]bool
 }
+// Backend is one destination of the service chain
+// ID is also the name of its KUBE-SEP endpoint chain, which DNATs to IP:Port
+// (pod IP + pod port for a local pod, node IP + node port for a remote node)
 type Backend struct {
 	ID   string
 	IP   string
 	Port string
+}
+
+// NewRemoteBackend builds the backend for another node serving this service
+// The node ID goes in the chain name so it never collides with a local pod index
+func NewRemoteBackend(serviceName, nodeID, nodeIP, nodePort string) Backend {
+	return Backend{
+		ID:   fmt.Sprintf("%s-%s-%s", KubeEndpointChainPrefix, serviceName, nodeID),
+		IP:   nodeIP,
+		Port: nodePort,
+	}
 }
 
 func NewService(name, clusterIP, clusterPort, nodePort, podPort string) *Service {
