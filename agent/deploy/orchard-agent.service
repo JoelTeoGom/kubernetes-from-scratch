@@ -1,0 +1,33 @@
+# systemd unit for the orchard node agent
+#
+# Install (as root):
+#   go build -o /usr/local/bin/orchard-agent ./cmd/agent
+#   cp deploy/orchard-agent.service /etc/systemd/system/
+#   mkdir -p /etc/orchard && echo 'LB_ADDRESS=http://192.168.1.50:9000' > /etc/orchard/agent.env
+#   systemctl daemon-reload && systemctl enable --now orchard-agent
+#
+# The hostname must end with the node number (node-1, node-2...), the pod CIDR is derived from it.
+
+[Unit]
+Description=orchard node agent (kubelet + kube-proxy)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/orchard/agent.env
+ExecStart=/usr/local/bin/orchard-agent
+Restart=on-failure
+RestartSec=3
+
+# Pods are started by the agent, so by default they would live in its cgroup and
+# systemctl stop/restart would kill them too (KillMode=control-group).
+# With KillMode=process only the agent gets the signal: pods keep running and the
+# agent adopts them again when it comes back.
+KillMode=process
+
+# Network namespaces, veth pairs, bridges and iptables need root
+User=root
+
+[Install]
+WantedBy=multi-user.target

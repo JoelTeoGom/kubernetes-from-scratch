@@ -215,6 +215,9 @@ func (a *Agent) ReleaseIP(releasedIP string) error {
 	a.allocated[releasedIP] = false
 	return nil
 }
+
+// ShutdownNode drains the node: every pod gets SIGTERM and, after the grace time, SIGKILL
+// It is not called when the agent stops, only for an explicit drain
 func (a *Agent) ShutdownNode(ctx context.Context) error {
 	//TODO get error
 	for _, service := range a.Services {

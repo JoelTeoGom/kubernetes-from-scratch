@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/JoelTeoGom/kubernetes-from-scratch/agent/internal/agent"
 	"github.com/JoelTeoGom/kubernetes-from-scratch/agent/internal/apiclient"
@@ -74,14 +73,8 @@ func main() {
 
 	<-ctx.Done()
 
-	shutdownctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	shutdownErr := node.ShutdownNode(shutdownctx)
-	if shutdownErr != nil {
-		fmt.Println(shutdownErr)
-	}
-
-	<-shutdownctx.Done()
-
+	// Stopping the agent is not draining the node: pods, netns and iptables rules stay as
+	// they are, so traffic keeps flowing while the agent restarts and adopts them again.
+	// Killing the pods (node.ShutdownNode) is left for an explicit drain order from the control plane
+	fmt.Println("agent stopped, pods left running")
 }
