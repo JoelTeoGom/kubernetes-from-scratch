@@ -41,8 +41,8 @@ client ──▶ lb data plane ──▶ nodeIP:NodePort
                                    │
                             PREROUTING
                                    │
-                            KUBE-SERVICES          -d clusterIP --dport → service chain
-                                   │               -d nodeIP   --dport → service chain
+                            KUBE-SERVICES          -d clusterIP --dport → KUBE-SVC (local + remote)
+                                   │               -d nodeIP   --dport → KUBE-EXT (local only)
                                    ▼
                             KUBE-SVC-<service>     -m statistic --probability 1/n
                                    │
@@ -87,6 +87,84 @@ node: a pod on another node is reached as `nodeIP:NodePort`, never by its pod IP
 is no conflict and no address coordination to do. Kubernetes allocates a distinct range per
 node because it needs real pod-to-pod routing across nodes; this project does not, and gets
 to skip the problem.
+
+---
+
+## Explaining how networking works in our environment
+
+### The scenario
+
+A cluster with three nodes and two services:
+
+- **`payments`** has three pods, one on each node (`node-1`, `node-2`, `node-3`).
+- **`users`** has a pod on `node-1`, and that pod wants to call `payments`.
+
+`users` does not know where the `payments` pods are. It only knows the service's
+`ClusterIP:ClusterPort`. Every connection should land on any of the three `payments` pods
+with the same probability, whether that pod is on the local node or on another one.
+
+Every node runs the same agent, so every node holds the same two chains per service:
+
+```
+KUBE-SERVICES
+ ├─ ClusterIP:ClusterPort → KUBE-SVC-payments  (local pods + remote nodes)
+ └─ NodeIP:NodePort       → KUBE-EXT-payments  (local pods only)
+```
+
+### Node 1, where the `users` pod runs
+
+1. `users` opens a connection to `ClusterIP:ClusterPort` of `payments`. That address is not
+   in its subnet, so the packet leaves through its default route: the gateway, which is the
+   node 1 bridge.
+2. `PREROUTING` → `KUBE-SERVICES`: the destination matches the ClusterIP, so the packet
+   jumps to **`KUBE-SVC-payments`**.
+3. `KUBE-SVC-payments` has one rule per backend, local pods first and remote nodes after:
+   ```
+   -m statistic --probability 0.33333 -j KUBE-SEP-payments-0        (local pod)
+   -m statistic --probability 0.50000 -j KUBE-SEP-payments-node-2   (node 2)
+                                      -j KUBE-SEP-payments-node-3   (node 3)
+   ```
+   Each backend ends up with 1/3: the first one takes 1/3, the second one 2/3 × 1/2 = 1/3,
+   and the last one takes whatever is left.
+4. Say node 3 wins. `KUBE-SEP-payments-node-3` does `DNAT → NodeIP3:NodePort`.
+5. On the way out, `KUBE-POSTROUTING` sees a source inside the pod CIDR and a destination
+   outside it, and applies `MASQUERADE`. The packet leaves with node 1's IP as its source.
+
+### Node 3
+
+6. The packet arrives at `NodeIP3:NodePort`. `KUBE-SERVICES` knows that port belongs to
+   `payments` and jumps to **`KUBE-EXT-payments`**, which only holds node 3's local pods:
+   ```
+   -j KUBE-SEP-payments-0   → DNAT 10.244.3.x:PodPort
+   ```
+7. The packet reaches the `payments` pod on node 3.
+
+### The way back
+
+8. The pod replies to node 1. The reply goes through node 3's host, where conntrack undoes
+   the DNAT. When it reaches node 1, conntrack undoes the masquerade and the DNAT, and
+   `users` gets the reply as if it came from the ClusterIP.
+
+### Notes
+
+- **The draw happens once per connection.** Only the first packet of a connection goes
+  through the `-m statistic` rules. Every packet after that follows the conntrack entry, so
+  the whole TCP connection always stays on the same backend.
+- **Why NodePort needs its own chain.** If the NodePort rule jumped to `KUBE-SVC-payments`,
+  step 6 would draw again among local and remote backends, and node 3 could send the packet
+  on to node 1 or node 2, bouncing it between nodes. `KUBE-EXT-payments` keeps it on node 3:
+  whoever reaches `NodeIP:NodePort` already picked this node.
+- **No masquerade mark needed.** Kubernetes marks traffic with `0x4000` (`KUBE-MARK-MASQ`)
+  to masquerade it. Here that is not needed: traffic sent to a remote node always comes from
+  a local pod, so the pod CIDR rule already masquerades it. Traffic arriving through a
+  NodePort always goes to a local pod, so the reply comes back through the same host and
+  conntrack can reverse it.
+- **A node with no pods of a service rejects its NodePort.** `KUBE-EXT-<service>` is then a
+  single `REJECT`. The control plane should only list a node as a remote backend when it has
+  pods of that service.
+- **Forwarding must be allowed.** Steps 1 and 7 cross the `FORWARD` chain, between the
+  bridge and the network. If the `FORWARD` policy is `DROP` (Docker sets it that way), those
+  packets are dropped unless `KUBE-FORWARD` accepts them.
 
 ---
 
