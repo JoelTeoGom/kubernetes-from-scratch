@@ -80,13 +80,16 @@ kernel demultiplexes by destination port for free, so the balancer never has to 
 payload to work out who is talking to it — which would break protocol-agnosticism and
 deadlock against any protocol where the server speaks first.
 
-### Pod addresses repeat across nodes
+### Every node owns a /24, but pod IPs stay local
 
-Every node hands out addresses from the same pod CIDR. Those addresses never leave their
-node: a pod on another node is reached as `nodeIP:NodePort`, never by its pod IP. So there
-is no conflict and no address coordination to do. Kubernetes allocates a distinct range per
-node because it needs real pod-to-pod routing across nodes; this project does not, and gets
-to skip the problem.
+Each node takes its own slice of `10.244.0.0/16`, derived from the number at the end of its
+hostname: `node-1` gets `10.244.1.0/24`, bridge `br1` and gateway `10.244.1.1`. No address
+coordination is needed, the hostname is enough.
+
+Pod IPs are unique across the cluster, but there are no routes between the nodes' pod
+ranges, so they never leave their node: a pod on another node is reached as
+`nodeIP:NodePort`, never by its pod IP. Kubernetes adds those routes (or an overlay) to get
+real pod-to-pod traffic across nodes; this project does not, and gets to skip the problem.
 
 ---
 
@@ -168,6 +171,79 @@ KUBE-SERVICES
 
 ---
 
+## How a pod is run
+
+There are no images and no container runtime. A pod is **a network namespace with a
+process in it**, and the agent plays the part of kubelet and container runtime at once.
+
+### On disk
+
+Everything lives under `/var/lib/orchard` on each node:
+
+```
+/var/lib/orchard/
+├── registry/main          — the binary every pod runs (our "image registry")
+├── secrets/env.local      — the env file every pod gets (our "secret manager")
+└── pods/
+    └── KUBE-SEP-payments-0/
+        ├── main           — copy of the binary
+        ├── env.local      — copy of the env file
+        ├── out.log        — the pod's stdout and stderr
+        └── pod.json       — what the agent needs to find the pod again
+```
+
+### Creating a pod
+
+`CreatePod` runs three steps, in this order:
+
+1. **Network** (`SetupPodNetwork`): create the netns, a veth pair, plug the host end into the
+   node bridge, give the pod end an IP from the node's /24 and a default route through the
+   bridge.
+2. **Process** (`SetupProcess`): create the pod directory, copy the binary and the env file
+   into it, and start the binary with `ip netns exec <netns> ./main` from that directory.
+   `ip netns exec` joins the namespace and then execs the binary, so the PID the agent gets
+   back is the pod's own.
+3. **Traffic** (`SetupPodIptables`): only now the pod gets its `KUBE-SEP` chain and joins the
+   service chains. Traffic is never sent to a pod whose process failed to start.
+
+Then `pod.json` is written with the pod's ID, service, IP, netns, veth, PID and the process
+start time.
+
+### Pods outlive the agent
+
+Stopping the agent is not draining the node. When the agent stops, pods keep running and
+their iptables rules stay in place, so traffic keeps flowing while the agent is down. For
+that, each pod is started:
+
+- **in its own session** (`setsid`), so a Ctrl-C or a signal sent to the agent never reaches it;
+- **writing to its own `out.log`**, not to the agent's stdout, which would disappear with the
+  agent;
+- under systemd, with **`KillMode=process`** (see
+  [`agent/deploy/orchard-agent.service`](agent/deploy/orchard-agent.service)), so
+  `systemctl restart` only signals the agent and not every process in its cgroup.
+
+Killing every pod (`ShutdownNode`) is kept for an explicit drain.
+
+### Adopting pods after a restart
+
+A restarted agent has lost its in-memory state, and it is no longer the parent of its
+pods. Kubernetes solves this with a shim process per container that the runtime can
+reconnect to; here the truth is `pod.json` plus `/proc`:
+
+1. Right after the node setup, and before creating anything, `AdoptPods` reads every
+   `pods/*/pod.json`.
+2. A pod counts as alive only if its PID exists **and** has the same start time
+   (`/proc/<pid>/stat`, field 22). PIDs get reused, PID + start time does not.
+3. Alive pods are adopted: their IP is marked as taken, and they wait until their service is
+   created again. Then they go back into its `LocalPods` before its chains are written, so
+   the service points to them from the start instead of rejecting traffic.
+4. Dead pods are cleaned up: netns, veth, endpoint chain and directory.
+
+An adopted pod is not a child of the agent, so the agent cannot `Wait` for it. It checks
+`/proc` once a second instead, and loses the exit code.
+
+---
+
 ## Scope and honest limits
 
 This is a toy. It is meant to teach me Linux networking and how Kubernetes is put together,
@@ -187,7 +263,8 @@ and it is written by hand on purpose. Which means:
   trouble, because Docker has its own opinions about the same chains.
 - **No declarative state yet.** The control plane dispatches imperative events. There is no
   desired state to reconcile against, which is the single biggest thing separating this
-  from an orchestrator. It is on the roadmap.
+  from an orchestrator. It is on the roadmap. Until then, a restarted agent adopts the pods
+  it finds alive, but nothing tells it whether the cluster still wants them, or wants more.
 
 ---
 
@@ -197,8 +274,8 @@ and it is written by hand on purpose. Which means:
 orchard/
 ├── orchestrator/  — API server, node registry, L4 load balancer
 ├── agent/         — node agent: registration, IPAM, pod netns + veth, iptables rules
-├── docs/          — notes and design write-ups
-└── TODO.md        — roadmap and open questions
+│   └── deploy/    — systemd unit for the agent
+└── docs/          — notes and design write-ups
 ```
 
 ---
